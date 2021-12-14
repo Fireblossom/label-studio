@@ -2,11 +2,15 @@
 """
 import os
 import io
+from urllib import request
 import uuid
 import logging
+from django.core.files.uploadedfile import InMemoryUploadedFile
 import pandas as pd
 import htmlmin
 from collections import Counter
+
+from label_studio.tests.utils import project_id
 try:
     import ujson as json
 except:
@@ -110,6 +114,46 @@ class FileUpload(models.Model):
         tasks = [{'data': {settings.DATA_UNDEFINED_NAME: body}}]
         return tasks
 
+    def read_task_from_uploaded_pdf_file(self):
+        tasks = []
+        logger.debug('Read 1 task from uploaded PDF file {}'.format(self.file.name))
+
+        import fitz
+        pdf_bytes = self.file.read()
+        pdf_file = fitz.open('pdf', pdf_bytes)
+        pages_num = pdf_file.pageCount
+
+        for page_id in range(pages_num):
+            page = fitz.open('pdf', pdf_bytes)
+            page.select([page_id])  # https://pymupdf.readthedocs.io/en/latest/document.html#Document.select
+            django_f = InMemoryUploadedFile(
+                file=io.BytesIO(page.tobytes()),
+                field_name='{}_{}.pdf'.format(os.path.splitext(self.filepath)[-2], page_id),
+                name='{}_{}.pdf'.format(os.path.splitext(self.filepath)[-2], page_id),
+                content_type='application/pdf',
+                size=len(page.tobytes()),
+                charset=None
+                )
+            page_pdf_instance = FileUpload(user=self.user, project=self.project, file=django_f)
+            page_pdf_instance.save()
+
+            page_img = page[0].get_pixmap()
+            django_f = InMemoryUploadedFile(
+                file=io.BytesIO(page_img.tobytes()),
+                field_name='{}_{}.png'.format(os.path.splitext(self.filepath)[-2], page_id),
+                name='{}_{}.png'.format(os.path.splitext(self.filepath)[-2], page_id),
+                content_type='image/png',
+                size=len(page_img.tobytes()),
+                charset=None
+                )
+            page_img_instance = FileUpload(user=self.user, project=self.project, file=django_f)
+            page_img_instance.save()
+
+            tasks.append({'data': {settings.DATA_UNDEFINED_NAME: page_img_instance.url,
+                                   'original_pdf': page_pdf_instance.url,
+                                   'source_file': self.filepath}})
+        return tasks
+
     def read_task_from_uploaded_file(self):
         logger.debug('Read 1 task from uploaded file {}'.format(self.file.name))
         tasks = [{'data': {settings.DATA_UNDEFINED_NAME: self.url}}]
@@ -141,6 +185,8 @@ class FileUpload(models.Model):
             # file as a single asset
             elif file_format in ('.html', '.htm', '.xml'):
                 tasks = self.read_task_from_hypertext_body()
+            elif file_format == '.pdf':
+                tasks = self.read_task_from_uploaded_pdf_file()
             else:
                 tasks = self.read_task_from_uploaded_file()
 
