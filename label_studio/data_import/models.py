@@ -10,7 +10,6 @@ import pandas as pd
 import htmlmin
 from collections import Counter
 
-from label_studio.tests.utils import project_id
 try:
     import ujson as json
 except:
@@ -118,10 +117,42 @@ class FileUpload(models.Model):
         tasks = []
         logger.debug('Read 1 task from uploaded PDF file {}'.format(self.file.name))
 
+        import pdf2image
         import fitz
+
         pdf_bytes = self.file.read()
         pdf_file = fitz.open('pdf', pdf_bytes)
         pages_num = pdf_file.pageCount
+
+        scanned = 0
+        for page in pdf_file:
+            if len(page.get_images()) == 1:
+                img_bbox = page.get_image_info()[0]['bbox']
+                area_img = (img_bbox[2]-img_bbox[0]) * (img_bbox[3]-img_bbox[1])
+                page_bbox = page.rect
+                if area_img/page_bbox.get_area() > .95:
+                    scanned += 1
+
+        if scanned > 0:  # Needs OCR
+            import ocrmypdf
+            import tempfile
+            import data_import.auto_crop as auto_crop
+            i = tempfile.NamedTemporaryFile()
+            o = tempfile.NamedTemporaryFile()
+            # pdf_file.save(i)
+            page_imgs = pdf2image.convert_from_bytes(pdf_bytes)
+            page_imgs = [auto_crop.autocrop(img) for img in page_imgs]
+            if len(page_imgs) > 1:
+                page_imgs[0].save(i, "PDF", resolution=100.0, save_all=True, append_images=page_imgs[1:])
+            else:
+                page_imgs[0].save(i, "PDF", resolution=100.0)
+            ocrmypdf.ocr(i.name, o.name, deskew=True, force_ocr=True)
+            pdf_file = fitz.open(o)
+            pdf_bytes = pdf_file.tobytes()
+            i.close()
+            o.close()
+
+        page_imgs = pdf2image.convert_from_bytes(pdf_bytes, dpi=72)
 
         for page_id in range(pages_num):
             page = fitz.open('pdf', pdf_bytes)
@@ -137,9 +168,11 @@ class FileUpload(models.Model):
             page_pdf_instance = FileUpload(user=self.user, project=self.project, file=django_f)
             page_pdf_instance.save()
 
-            page_img = page[0].get_pixmap()
+            page_img = page_imgs[page_id]
+            bytes_obj = io.BytesIO()
+            page_img.save(bytes_obj, format="PNG")
             django_f = InMemoryUploadedFile(
-                file=io.BytesIO(page_img.tobytes()),
+                file=bytes_obj,
                 field_name='{}_{}.png'.format(os.path.splitext(self.filepath)[-2], page_id),
                 name='{}_{}.png'.format(os.path.splitext(self.filepath)[-2], page_id),
                 content_type='image/png',
@@ -150,8 +183,8 @@ class FileUpload(models.Model):
             page_img_instance.save()
 
             tasks.append({'data': {settings.DATA_UNDEFINED_NAME: page_img_instance.url,
-                                   'original_pdf': page_pdf_instance.url,
-                                   'source_file': self.filepath}})
+                                   'page_pdf': page_pdf_instance.url,
+                                   'full_pdf': self.filepath}})
         return tasks
 
     def read_task_from_uploaded_file(self):
