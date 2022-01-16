@@ -9,6 +9,8 @@ from django.core.files.uploadedfile import InMemoryUploadedFile
 import pandas as pd
 import htmlmin
 from collections import Counter
+import ocrmypdf
+import tempfile
 
 try:
     import ujson as json
@@ -134,18 +136,10 @@ class FileUpload(models.Model):
                     scanned += 1
 
         if scanned > 0:  # Needs OCR
-            import ocrmypdf
-            import tempfile
-            import data_import.auto_crop as auto_crop
+            
             i = tempfile.NamedTemporaryFile()
             o = tempfile.NamedTemporaryFile()
-            # pdf_file.save(i)
-            page_imgs = pdf2image.convert_from_bytes(pdf_bytes)
-            page_imgs = [auto_crop.autocrop(img) for img in page_imgs]
-            if len(page_imgs) > 1:
-                page_imgs[0].save(i, "PDF", resolution=100.0, save_all=True, append_images=page_imgs[1:])
-            else:
-                page_imgs[0].save(i, "PDF", resolution=100.0)
+            pdf_file.save(i)
             ocrmypdf.ocr(i.name, o.name, deskew=True, force_ocr=True)
             pdf_file = fitz.open(o)
             pdf_bytes = pdf_file.tobytes()
