@@ -12,8 +12,9 @@ from django.db import transaction, models
 from annoying.fields import AutoOneToOneField
 from functools import lru_cache
 
+from core.redis import start_job_async_or_sync
 from tasks.models import Task, Prediction, Annotation, Q_task_finished_annotations, bulk_update_stats_project_tasks
-from core.utils.common import create_hash, sample_query, get_attr_or_item, load_func
+from core.utils.common import create_hash, get_attr_or_item, load_func
 from core.utils.exceptions import LabelStudioValidationErrorSentryIgnored
 from core.label_config import (
     validate_label_config,
@@ -25,7 +26,9 @@ from core.label_config import (
     get_all_control_tag_tuples,
     get_annotation_tuple,
 )
+from core.bulk_update_utils import bulk_update
 from label_studio_tools.core.label_config import parse_config
+
 
 logger = logging.getLogger(__name__)
 
@@ -85,6 +88,13 @@ ProjectMixin = load_func(settings.PROJECT_MIXIN)
 
 
 class Project(ProjectMixin, models.Model):
+    class SkipQueue(models.TextChoices):
+        # requeue to the end of the same annotator’s queue => annotator gets this task at the end of the queue
+        REQUEUE_FOR_ME = 'REQUEUE_FOR_ME', 'Requeue for me'
+        # requeue skipped tasks back to the common queue, excluding skipping annotator [current default] => another annotator gets this task
+        REQUEUE_FOR_OTHERS = 'REQUEUE_FOR_OTHERS', 'Requeue for others'
+        # ignore skipped tasks => skip is a valid annotation, task is completed (finished=True)
+        IGNORE_SKIPPED = 'IGNORE_SKIPPED', 'Ignore skipped'
 
     objects = ProjectManager()
     __original_label_config = None
@@ -115,11 +125,11 @@ class Project(ProjectMixin, models.Model):
         default='<View></View>',
         help_text='Label config in XML format. See more about it in documentation',
     )
-    parsed_label_config = models.TextField(
+    parsed_label_config = models.JSONField(
         _('parsed label config'),
         blank=True,
         null=True,
-        default='',
+        default=None,
         help_text='Parsed label config in JSON format. See more about it in documentation',
     )
     expert_instruction = models.TextField(
@@ -174,11 +184,15 @@ class Project(ProjectMixin, models.Model):
     )
     min_annotations_to_start_training = models.IntegerField(
         _('min_annotations_to_start_training'),
-        default=10,
+        default=0,
         help_text='Minimum number of completed tasks after which model training is started',
     )
 
-    control_weights = JSONField(_('control weights'), null=True, default=dict, help_text='Weights for control tags')
+    control_weights = JSONField(_('control weights'), null=True, default=dict, help_text="Dict of weights for each control tag in metric calculation. Each control tag (e.g. label or choice) will "
+                                                                                         "have it's own key in control weight dict with weight for each label and overall weight." 
+                                                                                         "For example, if bounding box annotation with control tag named my_bbox should be included with 0.33 weight in agreement calculation, "
+                                                                                         "and the first label Car should be twice more important than Airplaine, then you have to need the specify: "
+                                                                                         "{'my_bbox': {'type': 'RectangleLabels', 'labels': {'Car': 1.0, 'Airplaine': 0.5}, 'overall': 0.33}")
     model_version = models.TextField(
         _('model version'), blank=True, null=True, default='', help_text='Machine learning model version'
     )
@@ -204,6 +218,7 @@ class Project(ProjectMixin, models.Model):
     )
 
     sampling = models.CharField(max_length=100, choices=SAMPLING_CHOICES, null=True, default=SEQUENCE)
+    skip_queue = models.CharField(max_length=100, choices=SkipQueue.choices, null=True, default=SkipQueue.REQUEUE_FOR_OTHERS)
     show_ground_truth_first = models.BooleanField(_('show ground truth first'), default=False)
     show_overlap_first = models.BooleanField(_('show overlap first'), default=False)
     overlap_cohort_percentage = models.IntegerField(_('overlap_cohort_percentage'), default=100)
@@ -220,6 +235,7 @@ class Project(ProjectMixin, models.Model):
         self.__original_label_config = self.label_config
         self.__maximum_annotations = self.maximum_annotations
         self.__overlap_cohort_percentage = self.overlap_cohort_percentage
+        self.__skip_queue = self.skip_queue
 
         # TODO: once bugfix with incorrect data types in List
         # logging.warning('! Please, remove code below after patching of all projects (extract_data_types)')
@@ -333,10 +349,9 @@ class Project(ProjectMixin, models.Model):
         membership = ProjectMember.objects.filter(user=user, project=self)
         return membership.exists() and membership.first().enabled
 
-    def update_tasks_states(
+    def _update_tasks_states(
         self, maximum_annotations_changed, overlap_cohort_percentage_changed, tasks_number_changed
     ):
-
         # if only maximum annotations parameter is tweaked
         if maximum_annotations_changed and not overlap_cohort_percentage_changed:
             tasks_with_overlap = self.tasks.filter(overlap__gt=1)
@@ -355,31 +370,55 @@ class Project(ProjectMixin, models.Model):
         elif tasks_number_changed and self.overlap_cohort_percentage < 100 and self.maximum_annotations > 1:
             self._rearrange_overlap_cohort()
 
-        if maximum_annotations_changed or overlap_cohort_percentage_changed:
+        if maximum_annotations_changed or overlap_cohort_percentage_changed or tasks_number_changed:
             bulk_update_stats_project_tasks(
                 self.tasks.filter(Q(annotations__isnull=False) & Q(annotations__ground_truth=False))
             )
 
+    def update_tasks_states(
+        self, maximum_annotations_changed, overlap_cohort_percentage_changed, tasks_number_changed
+    ):
+        start_job_async_or_sync(self._update_tasks_states, maximum_annotations_changed, overlap_cohort_percentage_changed, tasks_number_changed)
+
+
     def _rearrange_overlap_cohort(self):
-        tasks_with_overlap = self.tasks.filter(overlap__gt=1)
-        tasks_with_overlap_count = tasks_with_overlap.count()
-        total_tasks = self.tasks.count()
+        """
+        Rearrange overlap depending on annotation count in tasks
+        """
+        all_project_tasks = Task.objects.filter(project=self)
+        max_annotations = self.maximum_annotations
+        must_tasks = int(self.tasks.count() * self.overlap_cohort_percentage / 100 + 0.5)
 
-        new_tasks_with_overlap_count = int(self.overlap_cohort_percentage / 100 * total_tasks + 0.5)
-        if tasks_with_overlap_count > new_tasks_with_overlap_count:
-            # TODO: warn if we try to reduce current cohort that is already labeled with overlap
-            reduce_by = tasks_with_overlap_count - new_tasks_with_overlap_count
-            reduce_tasks = sample_query(tasks_with_overlap, reduce_by)
-            reduce_tasks.update(overlap=1)
-            reduced_tasks_ids = reduce_tasks.values_list('id', flat=True)
-            tasks_with_overlap.exclude(id__in=reduced_tasks_ids).update(overlap=self.maximum_annotations)
+        tasks_with_max_annotations = all_project_tasks.annotate(
+            anno=Count('annotations', filter=Q_task_finished_annotations & Q(annotations__ground_truth=False))
+        ).filter(anno__gte=max_annotations)
 
-        elif tasks_with_overlap_count < new_tasks_with_overlap_count:
-            increase_by = new_tasks_with_overlap_count - tasks_with_overlap_count
-            tasks_without_overlap = self.tasks.filter(overlap=1)
-            increase_tasks = sample_query(tasks_without_overlap, increase_by)
-            increase_tasks.update(overlap=self.maximum_annotations)
-            tasks_with_overlap.update(overlap=self.maximum_annotations)
+        tasks_with_min_annotations = all_project_tasks.exclude(
+            id__in=tasks_with_max_annotations
+        )
+
+        # check how many tasks left to finish
+        left_must_tasks = max(must_tasks - tasks_with_max_annotations.count(), 0)
+        if left_must_tasks > 0:
+            # if there are unfinished tasks update tasks with count(annotations) >= overlap
+            tasks_with_max_annotations.update(overlap=max_annotations)
+            # order other tasks by count(annotations)
+            tasks_with_min_annotations = tasks_with_min_annotations.annotate(
+                anno=Count('annotations')
+            ).order_by('-anno')
+            objs = []
+            # assign overlap depending on annotation count
+            for item in tasks_with_min_annotations[:left_must_tasks]:
+                item.overlap = max_annotations
+                objs.append(item)
+            for item in tasks_with_min_annotations[left_must_tasks:]:
+                item.overlap = 1
+                objs.append(item)
+            with transaction.atomic():
+                bulk_update(objs, update_fields=['overlap'], batch_size=settings.BATCH_SIZE)
+        else:
+            tasks_with_max_annotations.update(overlap=max_annotations)
+            tasks_with_min_annotations.update(overlap=1)
 
     def remove_tasks_by_file_uploads(self, file_upload_ids):
         self.tasks.filter(file_upload_id__in=file_upload_ids).delete()
@@ -471,11 +510,12 @@ class Project(ProjectMixin, models.Model):
             )
 
         # validate labels consistency
-        labels_from_config = get_all_labels(config_string)
+        labels_from_config, dynamic_label_from_config = get_all_labels(config_string)
         created_labels = self.summary.created_labels
         for control_tag_from_data, labels_from_data in created_labels.items():
             # Check if labels created in annotations, and their control tag has been removed
-            if labels_from_data and control_tag_from_data not in labels_from_config:
+            if labels_from_data and ((control_tag_from_data not in labels_from_config) and (
+                    control_tag_from_data not in dynamic_label_from_config)):
                 raise LabelStudioValidationErrorSentryIgnored(
                     f'There are {sum(labels_from_data.values(), 0)} annotation(s) created with tag '
                     f'"{control_tag_from_data}", you can\'t remove it'
@@ -484,8 +524,9 @@ class Project(ProjectMixin, models.Model):
             if not set(labels_from_data).issubset(set(labels_from_config_by_tag)):
                 different_labels = list(set(labels_from_data).difference(labels_from_config_by_tag))
                 diff_str = '\n'.join(f'{l} ({labels_from_data[l]} annotations)' for l in different_labels)
-                if strict is True:
-                    raise LabelStudioValidationErrorSentryIgnored(f'These labels still exist in annotations:\n{diff_str}')
+                if (strict is True) and (control_tag_from_data not in dynamic_label_from_config):
+                    raise LabelStudioValidationErrorSentryIgnored(
+                        f'These labels still exist in annotations:\n{diff_str}')
                 else:
                     logger.warning(f'project_id={self.id} inconsistent labels in config and annotations: {diff_str}')
 
@@ -499,7 +540,7 @@ class Project(ProjectMixin, models.Model):
         return {'deleted_predictions': count}
 
     def get_updated_weights(self):
-        outputs = self.get_parsed_config()
+        outputs = self.get_parsed_config(autosave_cache=False)
         control_weights = {}
         exclude_control_types = ('Filter',)
         for control_name in outputs:
@@ -515,17 +556,19 @@ class Project(ProjectMixin, models.Model):
 
     def save(self, *args, recalc=True, **kwargs):
         exists = True if self.pk else False
+        project_with_config_just_created = not exists and self.label_config
 
-        if self.label_config and (self._label_config_has_changed() or not exists or not self.control_weights):
-            self.control_weights = self.get_updated_weights()
-        super(Project, self).save(*args, **kwargs)
-        project_with_config_just_created = not exists and self.pk and self.label_config
         if self._label_config_has_changed() or project_with_config_just_created:
             self.data_types = extract_data_types(self.label_config)
             self.parsed_label_config = parse_config(self.label_config)
 
+        if self.label_config and (self._label_config_has_changed() or not exists or not self.control_weights):
+            self.control_weights = self.get_updated_weights()
+
         if self._label_config_has_changed():
             self.__original_label_config = self.label_config
+
+        super(Project, self).save(*args, **kwargs)
 
         if not exists:
             steps = ProjectOnboardingSteps.objects.all()
@@ -541,6 +584,11 @@ class Project(ProjectMixin, models.Model):
             )
             self.__maximum_annotations = self.maximum_annotations
             self.__overlap_cohort_percentage = self.overlap_cohort_percentage
+
+        if self.__skip_queue != self.skip_queue:
+            bulk_update_stats_project_tasks(
+                self.tasks.filter(Q(annotations__isnull=False) & Q(annotations__ground_truth=False))
+            )
 
         if hasattr(self, 'summary'):
             # Ensure project.summary is consistent with current tasks / annotations
@@ -664,13 +712,14 @@ class Project(ProjectMixin, models.Model):
     def max_tasks_file_size():
         return settings.TASKS_MAX_FILE_SIZE
 
-    def get_control_tags_from_config(self):
-        return self.get_parsed_config()
+    def get_parsed_config(self, autosave_cache=True):
+        if self.parsed_label_config is None:
+            self.parsed_label_config = parse_config(self.label_config)
 
-    def get_parsed_config(self):
-        if self.parsed_label_config:
-            return self.parsed_label_config
-        return parse_config(self.label_config)
+            # if autosave_cache:
+            #    Project.objects.filter(id=self.id).update(parsed_label_config=self.parsed_label_config)
+
+        return self.parsed_label_config
 
     def get_counters(self):
         """Method to get extra counters data from Manager method with_counts()
@@ -828,7 +877,7 @@ class ProjectSummary(models.Model):
             self.common_data_columns = list(sorted(set(self.common_data_columns) & common_data_columns))
         logger.debug(f'summary.all_data_columns = {self.all_data_columns}')
         logger.debug(f'summary.common_data_columns = {self.common_data_columns}')
-        self.save()
+        self.save(update_fields=['all_data_columns', 'common_data_columns'])
 
     def remove_data_columns(self, tasks):
         all_data_columns = dict(self.all_data_columns)
@@ -852,7 +901,7 @@ class ProjectSummary(models.Model):
             self.common_data_columns = common_data_columns
         logger.debug(f'summary.all_data_columns = {self.all_data_columns}')
         logger.debug(f'summary.common_data_columns = {self.common_data_columns}')
-        self.save()
+        self.save(update_fields=['all_data_columns', 'common_data_columns', ])
 
     def _get_annotation_key(self, result):
         result_type = result.get('type', None)
@@ -912,7 +961,7 @@ class ProjectSummary(models.Model):
         logger.debug(f'summary.created_labels = {labels}')
         self.created_annotations = created_annotations
         self.created_labels = labels
-        self.save()
+        self.save(update_fields=['created_annotations', 'created_labels'])
 
     def remove_created_annotations_and_labels(self, annotations):
         created_annotations = dict(self.created_annotations)
@@ -946,4 +995,4 @@ class ProjectSummary(models.Model):
         logger.debug(f'summary.created_labels = {labels}')
         self.created_annotations = created_annotations
         self.created_labels = labels
-        self.save()
+        self.save(update_fields=['created_annotations', 'created_labels'])
