@@ -15,6 +15,7 @@ from rest_framework.fields import SkipField
 from rest_framework.settings import api_settings
 from rest_flex_fields import FlexFieldsModelSerializer
 
+from core.feature_flags import flag_set
 from projects.models import Project
 from tasks.models import Task, Annotation, AnnotationDraft, Prediction
 from tasks.validation import TaskValidator
@@ -292,15 +293,23 @@ class BaseTaskSerializerBulk(serializers.ListSerializer):
                 task_predictions.append(predictions)
 
             # add tasks first
-            for task in validated_tasks:
-                t = Task(project=self.project, data=task['data'], meta=task.get('meta', {}),
-                         overlap=self.project.maximum_annotations,
-                         file_upload_id=task.get('file_upload_id'))
-                db_tasks.append(t)
+            max_overlap = self.project.maximum_annotations
 
-                # deprecated meta warning
-                if 'meta' in task:
-                    logger.warning('You task data has field "meta" which is deprecated and it will be removed in future')
+            # identify max inner id
+            tasks = Task.objects.filter(project=self.project)
+            max_inner_id = (tasks.order_by("-inner_id")[0].inner_id + 1) if tasks else 1
+
+            for i, task in enumerate(validated_tasks):
+                t = Task(
+                    project=self.project,
+                    data=task['data'],
+                    meta=task.get('meta', {}),
+                    overlap=max_overlap,
+                    is_labeled=len(task_annotations[i]) >= max_overlap,
+                    file_upload_id=task.get('file_upload_id'),
+                    inner_id=max_inner_id + i
+                )
+                db_tasks.append(t)
 
             if settings.DJANGO_DB == settings.DJANGO_DB_SQLITE:
                 self.db_tasks = []
@@ -497,6 +506,10 @@ class TaskWithAnnotationsAndPredictionsAndDraftsSerializer(TaskSerializer):
     predictions = serializers.SerializerMethodField(default=[], read_only=True)
     annotations = serializers.SerializerMethodField(default=[], read_only=True)
     drafts = serializers.SerializerMethodField(default=[], read_only=True)
+    updated_by = serializers.SerializerMethodField(default=[], read_only=True)
+
+    def get_updated_by(self, task):
+        return [{'user_id': task.updated_by_id}] if task.updated_by_id else []
 
     def get_predictions(self, task):
         predictions = task.predictions
@@ -527,6 +540,27 @@ class TaskWithAnnotationsAndPredictionsAndDraftsSerializer(TaskSerializer):
             drafts = drafts.filter(user=user)
 
         return AnnotationDraftSerializer(drafts, many=True, read_only=True, default=[], context=self.context).data
+
+
+class NextTaskSerializer(TaskWithAnnotationsAndPredictionsAndDraftsSerializer):
+    def get_predictions(self, task):
+        project = task.project
+        if not project.show_collab_predictions:
+            return []
+        else:
+            for ml_backend in project.ml_backends.all():
+                ml_backend.predict_tasks([task])
+            return super().get_predictions(task)
+
+    def get_annotations(self, task):
+        result = []
+        annotations = super().get_annotations(task)
+        if 'request' in self.context and hasattr(self.context['request'], 'user'):
+            user = self.context['request'].user
+            for annotation in annotations:
+                if annotation.get('completed_by') == user.id:
+                    result.append(annotation)
+        return result
 
 
 class TaskIDWithAnnotationsAndPredictionsSerializer(ModelSerializer):
