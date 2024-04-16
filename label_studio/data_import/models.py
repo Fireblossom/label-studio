@@ -9,8 +9,7 @@ from django.core.files.uploadedfile import InMemoryUploadedFile
 import pandas as pd
 import htmlmin
 from collections import Counter
-import ocrmypdf
-import tempfile
+import hashlib
 
 try:
     import ujson as json
@@ -123,8 +122,10 @@ class FileUpload(models.Model):
         import fitz
 
         pdf_bytes = self.file.read()
+        hash_str = hashlib.sha256(pdf_bytes).hexdigest()
+
         pdf_file = fitz.open('pdf', pdf_bytes)
-        pages_num = pdf_file.pageCount
+        pages_num = pdf_file.page_count 
 
         scanned = 0
         for page in pdf_file:
@@ -136,15 +137,26 @@ class FileUpload(models.Model):
                     scanned += 1
 
         if scanned > 0:  # Needs OCR
-            
+            import ocrmypdf
+            import tempfile
+            #import data_import.auto_crop as auto_crop
             i = tempfile.NamedTemporaryFile()
             o = tempfile.NamedTemporaryFile()
             pdf_file.save(i)
-            ocrmypdf.ocr(i.name, o.name, deskew=True, force_ocr=True)
+            #page_imgs = pdf2image.convert_from_bytes(pdf_bytes)
+            #page_imgs = [auto_crop.autocrop(img) for img in page_imgs]
+            #if len(page_imgs) > 1:
+            #    page_imgs[0].save(i, "PDF", resolution=100.0, save_all=True, append_images=page_imgs[1:])
+            #else:
+            #    page_imgs[0].save(i, "PDF", resolution=100.0)
+            try:
+                ocrmypdf.ocr(i.name, o.name, redo_ocr=True, skip_big=50)
+            except Exception as e:
+                print(e)
             pdf_file = fitz.open(o)
             pdf_bytes = pdf_file.tobytes()
-            i.close()
-            o.close()
+            #i.close()
+            #o.close()
 
         page_imgs = pdf2image.convert_from_bytes(pdf_bytes, dpi=72)
 
@@ -178,7 +190,10 @@ class FileUpload(models.Model):
 
             tasks.append({'data': {settings.DATA_UNDEFINED_NAME: page_img_instance.url,
                                    'page_pdf': page_pdf_instance.url,
-                                   'full_pdf': self.filepath}})
+                                   'full_pdf': self.filepath,
+                                   'page_no': page_id,
+                                   'hash': hash_str
+                                   }})
         return tasks
 
     def read_task_from_uploaded_file(self):
